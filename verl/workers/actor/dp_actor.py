@@ -372,7 +372,7 @@ class DataParallelPPOActor(BasePPOActor):
             "advantages",
         ]
         if self.config.use_kl_loss:
-            select_keys.append("ref_log_prob")
+            select_keys.append("ref_log_prob")         
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -456,7 +456,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
-                        rollout_is_weights=rollout_is_weights,
+                        rollout_is_weights=rollout_is_weights,                    
                     )
 
                     if entropy_coeff != 0:

@@ -60,7 +60,122 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+import verl.utils.torch_functional as verl_F
 
+def compute_grpo(
+    data, 
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    mode="default", 
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for GRPO, operating only on Outcome reward
+    (with only one scalar reward for each response).
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the GRPO advantage
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Note:
+        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
+        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    id2score = defaultdict(list)
+    id2status = defaultdict(list)
+    no_reward_mask = []
+    id2mean = {}
+    id2std = {}
+
+    reward_logs = data.non_tensor_batch.get("reward_log", [])
+
+    token_level_scores = data.batch["token_level_scores"].clone()
+    score_mask = data.batch["token_level_score_mask"]
+    index = data.non_tensor_batch["uid"]
+    response_mask = data.batch["response_mask"]
+
+    scores = token_level_scores[score_mask > 0].view(token_level_scores.shape[0], -1).sum(dim=1)
+
+    num_pos = (score_mask > 0).sum(dim=1)
+    assert torch.all(num_pos == 1), "Currently only support one positive reward token per sequence."
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+            id2status[index[i]].append(reward_logs[i]["fail_parsing"])
+
+        for i in range(bsz):
+            fail_parsing_list = id2status[index[i]]
+            label_fail = True if 2 in fail_parsing_list else False
+            no_reward_mask.append(label_fail)
+
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+        
+        if mode == "optimize_threshold":
+            ori_scores = token_level_scores.sum(dim=-1)
+            valid_mask = [log.get("fail_parsing") == 0 for log in reward_logs]
+            correct_minus_error = [log.get("num_correct") - log.get("num_wrong") for log in reward_logs]
+            subgroup = defaultdict(lambda: defaultdict(list))
+            nor_scores = defaultdict(lambda: defaultdict(list))
+            best_sid = {}
+            for i in range(bsz):
+                idx = index[i]
+                if not valid_mask[i]:
+                    continue
+                cm_i = correct_minus_error[i]
+                if idx not in best_sid:
+                    best_sid[idx] = cm_i
+                best_sid[idx] = max(best_sid[idx], cm_i)
+                subgroup[idx][cm_i].append(i)
+                nor_scores[idx][cm_i].append(float(scores[i].item()))
+            
+            for gid, subdict in subgroup.items():
+                if gid not in best_sid or best_sid[gid] < 0:
+                    continue  
+                sid = best_sid[gid]              
+                if sid not in subdict:
+                    continue
+                items = subdict[sid]
+                scores[items] = torch.where((ori_scores[items]>0) & (scores[items]<0), torch.zeros_like(scores[items]), scores[items])
+
+        ignore = torch.tensor(no_reward_mask, device=scores.device, dtype=torch.bool)
+        scores = torch.where(ignore, torch.zeros_like(scores), scores)
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
 
 @dataclass
 class ResourcePoolManager:
@@ -134,7 +249,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         tuple: A tuple containing:
             - The updated data with token-level rewards adjusted by KL penalty
             - A dictionary of metrics related to the KL penalty
-    """
+    """    
     response_mask = data.batch["response_mask"]
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
@@ -226,16 +341,14 @@ def compute_advantage(
                 data,
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
-            )
+            )    
     elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
-
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
+        advantages, returns = compute_grpo(
+            data=data,
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
+            mode=config.get("mode"),
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         data.batch["advantages"] = advantages
@@ -502,15 +615,14 @@ class RayPPOTrainer:
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
-        # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
 
-        # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
@@ -1038,7 +1150,6 @@ class RayPPOTrainer:
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
@@ -1088,6 +1199,10 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # Plumb checkpoint root + step through to reward manager (used by m3_agent for reward-log dumps).
+                    batch.meta_info["root_path"] = self.config.trainer.default_local_dir
+                    batch.meta_info["global_steps"] = self.global_steps
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1097,7 +1212,7 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor, reward_mask, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1131,13 +1246,17 @@ class RayPPOTrainer:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                    
+                    if self.config.data.remove_supplement_prompt:
+                        self.train_dataset.modify_batch(batch)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            reward_tensor, reward_mask, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+                        batch.batch["token_level_score_mask"] = reward_mask
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})

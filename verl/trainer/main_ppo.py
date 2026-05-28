@@ -17,7 +17,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
-
+import datasets
 import hydra
 import ray
 from omegaconf import OmegaConf
@@ -30,6 +30,7 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
+from verl.utils.dataset.vl_dataset import VLDataset
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -65,6 +66,11 @@ def run_ppo(config) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
+    resources = {}
+    # Check worker resources (ensure main_task is not scheduled on head)
+    if "workergroup_0_resource" in ray.available_resources():
+        resources.update({"workergroup_0_resource": 1})
+
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
     if (
@@ -79,9 +85,9 @@ def run_ppo(config) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = TaskRunner.options(resources=resources, runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = TaskRunner.remote()
+        runner = TaskRunner.options(resources=resources).remote()
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -282,21 +288,25 @@ class TaskRunner:
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
+        # val_reward_fn = load_reward_manager(
+        #     config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+        # )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+        # train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
+        # val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+        train_dataset = VLDataset(config.data.train_files, config.data, processor, config.trainer.default_local_dir)
+        val_dataset = VLDataset(config.data.val_files, config.data, processor, config.trainer.default_local_dir)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
+        trainer_cls = RayPPOTrainer
+
         # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
@@ -304,7 +314,7 @@ class TaskRunner:
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn,
+            val_reward_fn=None,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             collate_fn=collate_fn,

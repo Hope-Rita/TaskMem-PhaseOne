@@ -76,7 +76,6 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
-
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -103,6 +102,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    score_mask = batch.batch["token_level_score_mask"]
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
@@ -132,7 +132,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     reward_max = torch.max(non_aborted_sequence_reward).detach().item()
     reward_min = torch.min(non_aborted_sequence_reward).detach().item()
 
-    valid_adv = torch.masked_select(advantages, response_mask)
+    trajectory_advantages = advantages[score_mask > 0].view(advantages.shape[0], -1).sum(dim=1)
+    traj_adv_list = trajectory_advantages.detach().cpu().tolist()
     valid_returns = torch.masked_select(returns, response_mask)
 
     if use_critic:
@@ -156,7 +157,76 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     else:
         raise ValueError("All samples are aborted, this should not happen.")
 
+    think_length, fail_case = [], []
+    avg_memory_count, redundancy_rate = [], []
+    invalid_face, fail_parsing = [], []
+    avg_face_count, avg_invalid_face_count = [], []
+    fail_evaluate, memory_token_len, acc_rate = [], [], []
+    avg_correct_reward_mean, avg_all_reward_mean, avg_adv_std = [], [], []
+    avg_r_think, avg_r_task = [], []
+    total_rate = []
+    id2score_correct = defaultdict(list)
+    id2score_all = defaultdict(list)
+    id2adv = defaultdict(list)
+    index = batch.non_tensor_batch["uid"]
+    assert len(batch.non_tensor_batch["reward_log"]) == len(index), (
+        f"reward_log len({len(batch.non_tensor_batch['reward_log'])}) != index len({len(index)})"
+    )
+    for i, (reward_log, uid) in enumerate(zip(batch.non_tensor_batch["reward_log"], index, strict=True)):
+        if reward_log["fail_parsing"] == 0:
+            avg_r_think.append(reward_log["r_think"])
+            avg_r_task.append(reward_log["r_task"])
+            id2score_correct[uid].append(reward_log["final_score"])
+            if len(reward_log["accuracy_list"]):
+                acc_rate.append(sum(reward_log["accuracy_list"]) / len(reward_log["accuracy_list"]))
+            if len(reward_log["valid_list"]):
+                total_rate.append(sum(reward_log["valid_list"]) / len(reward_log["valid_list"]))
+            if len(reward_log["redundancy_list"]):
+                redundancy_rate.append(1 - sum(reward_log["redundancy_list"]) / len(reward_log["redundancy_list"]))
+            avg_memory_count.append(len(reward_log["accuracy_list"]))
+            avg_face_count.append(sum(reward_log["has_face_list"]))
+            if sum(reward_log["has_face_list"]):
+                avg_invalid_face_count.append(sum(reward_log["invalid_face_list"]))
+            memory_token_len.append(reward_log["memory_token_length"])
+
+        elif reward_log["fail_parsing"] == 2:
+            fail_evaluate.append(1)
+        id2adv[uid].append(float(traj_adv_list[i]))
+        id2score_all[uid].append(reward_log["final_score"])
+        invalid_face.append(1 if reward_log["has_invalid_face"] else 0)
+        fail_parsing.append(1 if reward_log["is_format_error"] else 0)
+        think_length.append(reward_log["think_len"])
+        fail_case.append(1 if reward_log["fail_parsing"] == 1 else 0)
+
+    for i in set(index):
+        avg_adv_std.append(torch.std(torch.tensor(id2adv[i], dtype=torch.float32)).detach().item())
+        if i in id2score_correct and len(id2score_correct[i]) > 0:
+            avg_correct_reward_mean.append(torch.mean(torch.tensor(id2score_correct[i], dtype=torch.float32)).detach().item())
+        avg_all_reward_mean.append(torch.mean(torch.tensor(id2score_all[i], dtype=torch.float32)).detach().item())
+
     metrics = {
+        "memory/count/mean": torch.mean(torch.tensor(avg_memory_count, dtype=torch.float32)).detach().item(),
+        "memory/count/max": torch.max(torch.tensor(avg_memory_count, dtype=torch.float32)).detach().item(),
+        "memory/count/min": torch.min(torch.tensor(avg_memory_count, dtype=torch.float32)).detach().item(),
+        "memory/face/total_count": torch.mean(torch.tensor(avg_face_count, dtype=torch.float32)).detach().item(),
+        "memory/face/invalid_count": torch.mean(torch.tensor(avg_invalid_face_count, dtype=torch.float32)).detach().item(),
+        "memory/redundancy_rate/mean": torch.mean(torch.tensor(redundancy_rate, dtype=torch.float32)).detach().item(),
+        "memory/total_rate/mean": torch.mean(torch.tensor(total_rate, dtype=torch.float32)).detach().item(),
+        "memory/accuracy/acc_rate": torch.mean(torch.tensor(acc_rate, dtype=torch.float32)).detach().item(),
+
+        "trajectory/reward/avg_think_length": sum(think_length) / len(think_length),
+        "trajectory/reward/avg_memory_length": sum(memory_token_len) / len(memory_token_len),
+        "trajectory/reward/avg_correct_reward_mean": torch.mean(torch.tensor(avg_correct_reward_mean, dtype=torch.float32)).detach().item(),
+        "trajectory/reward/avg_all_reward_mean": torch.mean(torch.tensor(avg_all_reward_mean, dtype=torch.float32)).detach().item(),
+        "trajectory/reward/avg_all_adv_std": torch.mean(torch.tensor(avg_adv_std, dtype=torch.float32)).detach().item(),
+        "trajectory/reward/avg_r_think": torch.mean(torch.tensor(avg_r_think, dtype=torch.float32)).detach().item(),
+        "trajectory/reward/avg_r_task": torch.mean(torch.tensor(avg_r_task, dtype=torch.float32)).detach().item(),
+
+        "trajectory/error/failure_case_count": torch.sum(torch.tensor(fail_case, dtype=torch.float32)).detach().item(),
+        "trajectory/error/invalid_face_count": torch.sum(torch.tensor(invalid_face, dtype=torch.float32)).detach().item(),
+        "trajectory/error/fail_parsing_count": torch.sum(torch.tensor(fail_parsing, dtype=torch.float32)).detach().item(),
+        "trajectory/error/fail_evaluate_count": torch.sum(torch.tensor(fail_evaluate, dtype=torch.float32)).detach().item(),
+
         # score
         "critic/score/mean": score_mean,
         "critic/score/max": score_max,
@@ -166,9 +236,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": torch.mean(trajectory_advantages).detach().item(),
+        "critic/advantages/max": torch.max(trajectory_advantages).detach().item(),
+        "critic/advantages/min": torch.min(trajectory_advantages).detach().item(),
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),
@@ -220,7 +290,6 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
-
     return metrics
 
 
@@ -292,9 +361,6 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     """
     total_num_tokens = sum(batch.meta_info["global_token_num"])
     time = timing_raw["step"]
-    # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
-    # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
-    # f'Theoretical TFLOPs/s/GPU​': promised_flops,
     return {
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
@@ -488,3 +554,4 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
 
     return data_src2var2metric2val
+

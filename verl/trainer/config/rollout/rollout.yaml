@@ -8,13 +8,13 @@ name: ???
 mode: sync
 
 # Sampling temperature for rollout.
-temperature: 1.0
+temperature: 0.7
 
 # Top-k sampling parameter. -1 for vLLM rollout, 0 for HF rollout.
-top_k: -1
+top_k: 20
 
 # Top-p sampling parameter. Default 1.0.
-top_p: 1
+top_p: 0.8
 
 # typically the same as data max prompt length
 # same as data.max_prompt_length if it exists

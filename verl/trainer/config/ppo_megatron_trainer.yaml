@@ -56,6 +56,8 @@ algorithm:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
+  mode: optimize_threshold # ["default", "optimize_threshold"]
+  threshold: 0.0
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: True
@@ -105,7 +107,7 @@ trainer:
   log_val_generations: 0
   nnodes: 1
   n_gpus_per_node: 8
-  save_freq: -1
+  save_freq: 20
   esi_redundant_time: 0
 
   # auto: find the last ckpt to resume. If can't find, start from scratch
@@ -192,4 +194,8 @@ global_profiler:
 ray_kwargs:
   ray_init:
     num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
+    runtime_env:
+      env_vars:
+        CUDA_DEVICE_MAX_CONNECTIONS: "1"  # For megatron communication/computation overlapping
+        VLLM_ALLREDUCE_USE_SYMM_MEM: "0"  # for vllm0.11.0 with TP
   timeline_json_file: null

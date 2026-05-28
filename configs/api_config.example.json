@@ -1,0 +1,22 @@
+{
+  "_comment": "Template for the Azure OpenAI endpoints used by verl/workers/reward_manager/m3_agent.py. Copy this file to configs/api_config.json (which is gitignored) and fill in your own credentials. Each entry can be either a single config object or a list of objects to round-robin across.",
+
+  "gpt-4o": {
+    "azure_endpoint": "https://<your-resource>.openai.azure.com/",
+    "api_version": "<API_VERSION>",
+    "api_key": "<YOUR_AZURE_OPENAI_KEY>"
+  },
+
+  "gpt-4o-mini": [
+    {
+      "azure_endpoint": "https://<resource-A>.openai.azure.com/",
+      "api_version": "<API_VERSION>",
+      "api_key": "<KEY_A>"
+    },
+    {
+      "azure_endpoint": "https://<resource-B>.openai.azure.com/",
+      "api_version": "<API_VERSION>",
+      "api_key": "<KEY_B>"
+    }
+  ]
+}

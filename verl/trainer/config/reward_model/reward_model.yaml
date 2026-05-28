@@ -95,3 +95,33 @@ profiler:
 
   # specific tool config
   tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
+
+reward_kwargs:
+  # set the best number of thinking length
+  think_length_threshold: 6400
+
+  # treat over thinking case as failure case if think_penalty is 0.0 else add soft penalty in [think_penalty, 0]
+  think_penalty: -1.0
+
+  # threshold for memory count
+  memory_length_threshold: 5
+
+  # scale the usefulness score to the range of [0, 1] * usefulness_scale
+  usefulness_scale: 1.0  
+
+  # if the length of memory is over memory_token_threshold, we assign it a score of 0.0
+  memory_token_threshold: 25
+
+  correct_reward: 0.5
+
+  wrong_reward: -0.5
+
+  format_penalty: -6.0
+
+  # text reward model
+  model_name_text: gpt-4o-2024-11-20
+
+  # video reward model
+  model_name_video: gemini-2.5-flash
+
+  failure_penalty: 0.0
