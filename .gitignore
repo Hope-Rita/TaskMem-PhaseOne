@@ -126,3 +126,12 @@ logs
 log
 outputs
 .history
+
+mbridge/
+
+# Local API credentials / model dirs (do NOT commit secrets)
+configs/api_config.json
+_upstream/
+
+# Generated diff against upstream verl (delivered separately, not tracked)
+verl-m3.patch

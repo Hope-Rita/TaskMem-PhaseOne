@@ -141,7 +141,7 @@ def load_reward_manager(
             )
         else:
             final_compute_score = default_compute_score
-
+    reward_kwargs["max_response_length"] = config.data.max_response_length
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,
@@ -164,13 +164,14 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
     try:
         reward_result = reward_fn(data, return_dict=True)
         reward_tensor = reward_result["reward_tensor"]
+        mask_tensor = reward_result["mask_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
     except Exception as e:
         print(f"Error in reward_fn: {e}")
         reward_tensor = reward_fn(data)
         reward_extra_infos_dict = {}
 
-    return reward_tensor, reward_extra_infos_dict
+    return reward_tensor, mask_tensor, reward_extra_infos_dict
 
 
 @ray.remote(num_cpus=1)

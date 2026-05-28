@@ -313,13 +313,16 @@ class MegatronPPOActor(BasePPOActor):
             "position_ids",
             "old_log_probs",
             "advantages",
+            "trajectory_uid",
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+
+
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
-            select_keys.append("rollout_is_weights")
+            select_keys.append("rollout_is_weights")   
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
@@ -380,6 +383,7 @@ class MegatronPPOActor(BasePPOActor):
             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
             if vpp_size is not None and vpp_size > 1:
                 microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
+                
                 micro_batches, indices = rearrange_micro_batches(
                     batch=mini_batch.batch,
                     num_batches_divided_by=microbatch_group_size_per_vp_stage,
@@ -425,8 +429,11 @@ class MegatronPPOActor(BasePPOActor):
             loss_agg_mode = self.config.loss_agg_mode
             # compute policy loss
             log_prob = output["log_probs"][:, -response_length - 1 : -1].contiguous()
+
             ret_entropy = None
             stats = {}
+
+
             if not forward_only:
                 old_log_prob = data["old_log_probs"]
                 advantages = data["advantages"]
@@ -455,13 +462,12 @@ class MegatronPPOActor(BasePPOActor):
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
                 )
-
                 stats.update(
                     {
                         "actor/pg_loss": pg_loss.detach().item(),
-                        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                        "actor/pg_clipfrac_pos_adv": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
-                        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        "actor/pg_clipfrac_neg_adv": pg_clipfrac_lower.detach().item(),
                     }
                 )
                 policy_loss = pg_loss
@@ -604,8 +610,6 @@ class MegatronPPOActor(BasePPOActor):
                 micro_batch_size=1,  # in use for pp = 1
                 forward_only=forward_only,
             )
-        # loss_reduces contains the stats returned from loss_func
-
         if self.has_multi_modal_inputs:
             data.batch.pop("multi_modal_inputs")
             data.batch.pop("multi_modal_inputs_idx")

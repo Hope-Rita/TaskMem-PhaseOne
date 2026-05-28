@@ -23,6 +23,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
+import os
 
 import numpy as np
 import torch
@@ -33,6 +34,8 @@ from verl.trainer.config import AlgoConfig
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
+import torch
+import torch.nn.functional as F
 
 PolicyLossFn = Callable[
     [
@@ -324,7 +327,6 @@ def compute_grpo_outcome_advantage(
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
-
     return scores, scores
 
 
@@ -876,6 +878,7 @@ def compute_policy_loss(
     )
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -1029,13 +1032,24 @@ def compute_policy_loss_gspo(
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
 
-    # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+    # # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
+    # pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    # pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+
+    clip_indicator = torch.gt(pg_losses2, pg_losses1).float()
+    seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+    clipfrac_per_seq = torch.sum(clip_indicator * response_mask, dim=-1) / seq_lengths  # (B,)
+    pg_clipfrac_seq = clipfrac_per_seq.mean()
 
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    
+    pos_mask = (advantages[:, 0] > 0).to(clipfrac_per_seq.dtype)
+    neg_mask = (advantages[:, 0] < 0).to(clipfrac_per_seq.dtype)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    clipfrac_per_pos = (clipfrac_per_seq * pos_mask).mean()
+    clipfrac_per_neg = (clipfrac_per_seq * neg_mask).mean()
+
+    return pg_loss, clipfrac_per_pos, ppo_kl, clipfrac_per_neg
 
 
 @register_policy_loss("gpg")
